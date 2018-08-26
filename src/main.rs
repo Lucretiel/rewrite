@@ -2,14 +2,14 @@ extern crate structopt;
 extern crate tempfile;
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 
 use structopt::StructOpt;
-use tempfile::NamedTempFile;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
@@ -77,15 +77,15 @@ struct Opt {
 }
 
 #[derive(Debug)]
-enum RewriteError {
+enum RewriteError<'a> {
     // Error opening the file for read
-    ReadOpenError { path: PathBuf, err: io::Error },
+    ReadOpenError { path: &'a Path, err: io::Error },
 
     // Error opening the file for write
-    WriteOpenError { path: PathBuf, err: io::Error },
+    WriteOpenError { path: &'a Path, err: io::Error },
 
     // Error writing to the file
-    WriteError { path: PathBuf, err: io::Error },
+    WriteError { path: &'a Path, err: io::Error },
 
     //"Failed to spawn command\n\tcommand: {:?}\n\treason: {}", command, err
     SpawnError { command: Command, err: io::Error },
@@ -97,7 +97,7 @@ enum RewriteError {
     CommandExitSignal(Option<i32>),
 }
 
-impl Display for RewriteError {
+impl<'a> Display for RewriteError<'a> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         use RewriteError::*;
 
@@ -126,7 +126,7 @@ impl Display for RewriteError {
     }
 }
 
-impl Error for RewriteError {
+impl<'a> Error for RewriteError<'a> {
     fn cause(&self) -> Option<&dyn Error> {
         use RewriteError::*;
 
@@ -142,15 +142,48 @@ impl Error for RewriteError {
     }
 }
 
-fn run() -> Result<(), RewriteError> {
-    let opt = Opt::from_args();
+#[derive(Debug)]
+struct ProcessResult {
+    buffer: Vec<u8>,
+    file: Option<File>,
+}
 
-    let file = File::open(&opt.rewrite_path).map_err(|err| RewriteError::ReadOpenError {
-        err,
-        path: opt.rewrite_path.to_owned(),
-    })?;
+impl ProcessResult {
+    fn new_buffer(buffer: Vec<u8>) -> Self {
+        ProcessResult { buffer, file: None }
+    }
 
-    let mut cmd_iter = opt.command.iter();
+    fn new_buffer_file(buffer: Vec<u8>, mut file: File) -> io::Result<Self> {
+        file.seek(SeekFrom::Start(0))?;
+        Ok(ProcessResult {
+            buffer,
+            file: Some(file),
+        })
+    }
+
+    fn write_to_file(self, dest: &mut File) -> io::Result<()> {
+        dest.write_all(&self.buffer)?;
+
+        match self.file {
+            Some(mut file) => io::copy(&mut file, dest).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+fn process_file<Arg, Cmd>(
+    path: &Path,
+    cmd_parts: Cmd,
+    with_env: bool,
+    buffer_size: usize,
+) -> Result<ProcessResult, RewriteError>
+where
+    Arg: AsRef<OsStr>,
+    Cmd: IntoIterator<Item = Arg>,
+{
+    let file = File::open(path).map_err(|err| RewriteError::ReadOpenError { err, path })?;
+
+    let mut cmd_iter = cmd_parts.into_iter();
 
     // Create command. The expect shouldn't trigger, since structopt requires at least 1 arg.
     let mut command = Command::new(cmd_iter.next().expect("No command was given"));
@@ -159,11 +192,11 @@ fn run() -> Result<(), RewriteError> {
     command.args(cmd_iter);
 
     // Attach environment
-    if !opt.no_env {
+    if with_env {
         command
-            .env("REWRITE_PATH", &opt.rewrite_path)
+            .env("REWRITE_PATH", path)
             // Panic shouldn't trigger, because File::open would have already failed.
-            .env("REWRITE_FILENAME", opt.rewrite_path.file_name().expect("Invalid filename"));
+            .env("REWRITE_FILENAME", path.file_name().expect("Invalid filename"));
     }
 
     // Attach pipes to the command
@@ -184,42 +217,42 @@ fn run() -> Result<(), RewriteError> {
         .expect("Failed to get child stdout");
 
     // First, read into a buffer. Fall back to a file if we exceed buffer-size
-    let mut buffer = Vec::with_capacity(opt.buffer_size);
+    let mut buffer = Vec::with_capacity(buffer_size);
 
     let amount_read = {
-        let mut limited_reader = child_stdout.take(opt.buffer_size as u64);
+        let mut limited_reader = child_stdout.take(buffer_size as u64);
         limited_reader
             .read_to_end(&mut buffer)
             .map_err(RewriteError::CommandPipeError)?
     };
 
-    if amount_read >= opt.buffer_size {
-        panic!("Don't yet support large files")
+    if amount_read >= buffer_size {
+        panic!("Don't yet support large files");
     } else {
-        if !opt.no_op {
-            // We got the whole thing in memory! Write it directly to the dest.
-            let mut file = OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&opt.rewrite_path)
-                .map_err(|err| RewriteError::WriteOpenError {
-                    err,
-                    path: opt.rewrite_path.to_owned(),
-                })?;
-
-            file.write_all(&buffer)
-                .map_err(|err| RewriteError::WriteError {
-                    err,
-                    path: opt.rewrite_path.to_owned(),
-                })?;
-        }
+        Ok(ProcessResult::new_buffer(buffer))
     }
+}
 
-    Ok(())
+fn run(opt: &Opt) -> Result<(), RewriteError> {
+    let path = &opt.rewrite_path;
+
+    let processed_data = process_file(path, opt.command.iter(), !opt.no_env, opt.buffer_size)?;
+
+    let mut dest_file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&opt.rewrite_path)
+        .map_err(|err| RewriteError::WriteOpenError { err, path })?;
+
+    processed_data
+        .write_to_file(&mut dest_file)
+        .map_err(|err| RewriteError::WriteError { err, path })
 }
 
 fn main() {
-    if let Err(err) = run() {
+    let opt = Opt::from_args();
+
+    if let Err(err) = run(&opt) {
         eprintln!("{}", err);
         exit(1);
     }
