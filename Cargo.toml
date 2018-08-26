@@ -1,0 +1,9 @@
+[package]
+name = "rewrite"
+version = "0.1.0"
+authors = ["Nathan West <Lucretiel@gmail.com>"]
+
+[dependencies]
+tempfile = "3.0.3"
+structopt = "0.2.10"
+# joinery = "1.0.0"
