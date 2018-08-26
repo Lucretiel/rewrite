@@ -303,15 +303,20 @@ fn run(opt: &Opt) -> Result<(), RewriteError> {
         opt.buffer_only,
     )?;
 
-    let mut dest_file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&opt.rewrite_path)
-        .map_err(|err| RewriteError::WriteOpenError { err, path })?;
+    if !opt.no_op {
+        let mut dest_file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&opt.rewrite_path)
+            .map_err(|err| RewriteError::WriteOpenError { err, path })?;
 
-    processed_data
-        .write_to_file(&mut dest_file)
-        .map_err(|err| RewriteError::WriteError { err, path })
+        processed_data
+            .write_to_file(&mut dest_file)
+            .map_err(|err| RewriteError::WriteError { err, path })
+    } else {
+        eprintln!("rewrite: successfully processed file. --no-op, skipping writeback.");
+        Ok(())
+    }
 }
 
 fn main() {
