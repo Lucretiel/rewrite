@@ -6,10 +6,18 @@ use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::{exit, Command, Stdio};
+use std::process::{exit, Child, Command, Stdio};
+
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt;
 
 use structopt::StructOpt;
+use tempfile::tempfile;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
@@ -38,35 +46,6 @@ struct Opt {
     /// Don't set REWRITE_* environment variables in the target
     no_env: bool,
 
-    #[structopt(short = "i", long = "ignore-nonzero")]
-    /// Ignore nonzero exit codes from the subprocess
-
-    #[structopt(
-        long = "tmpdir-sibling",
-        raw(
-            overrides_with_all = "&[
-        \"tmpdir-sibling\",
-        \"tmpdir-cwd\",
-        \"tmpdir-system\",
-        \"tmpdir\",
-    ]"
-        )
-    )]
-    /// Create the temporary file in the same directory as the target file. This is the default.
-    tmpdir_sibling: bool,
-
-    #[structopt(long = "tmpdir-cwd")]
-    /// Create the temporary file in the current working directory.
-    tmpdir_cwd: bool,
-
-    #[structopt(long = "tmpdir-system")]
-    /// Create the temporary file in the system temporary directory.
-    tmpdir_system: bool,
-
-    #[structopt(long = "tmpdir", short = "t", parse(from_os_str))]
-    /// Create the temporary file in this directory.
-    tmpdir: Option<PathBuf>,
-
     #[structopt(parse(from_os_str))]
     /// The file to rewrite
     rewrite_path: PathBuf,
@@ -78,23 +57,17 @@ struct Opt {
 
 #[derive(Debug)]
 enum RewriteError<'a> {
-    // Error opening the file for read
     ReadOpenError { path: &'a Path, err: io::Error },
-
-    // Error opening the file for write
     WriteOpenError { path: &'a Path, err: io::Error },
-
-    // Error writing to the file
     WriteError { path: &'a Path, err: io::Error },
-
-    //"Failed to spawn command\n\tcommand: {:?}\n\treason: {}", command, err
     SpawnError { command: Command, err: io::Error },
-
     CommandPipeError(io::Error),
-
     CommandExitCode(i32),
-
     CommandExitSignal(Option<i32>),
+    CreateTempfileError(io::Error),
+    TempfileWriteError(io::Error),
+    TempfileSeekError(io::Error),
+    TempfileDisallowed,
 }
 
 impl<'a> Display for RewriteError<'a> {
@@ -118,10 +91,21 @@ impl<'a> Display for RewriteError<'a> {
                 command, err
             ),
             CommandPipeError(err) => write!(f, "Error reading subprocess output: {}", err),
-
             CommandExitCode(code) => write!(f, "Command exited with non-zero status code {}", code),
             CommandExitSignal(Some(sig)) => write!(f, "Subprocess exited via signal {}", sig),
             CommandExitSignal(None) => write!(f, "Subprocess exited due to unknown signal"),
+            CreateTempfileError(err) => write!(
+                f,
+                "Failed to create temporary file for scratch space: {}",
+                err
+            ),
+            TempfileWriteError(err) => write!(
+                f,
+                "Error copying process output into temporary file: {}",
+                err
+            ),
+            TempfileSeekError(err) => write!(f, "Error seeking temporary file: {}", err),
+            TempfileDisallowed => write!(f, "command output exceeded in-memory buffer limit"),
         }
     }
 }
@@ -138,6 +122,10 @@ impl<'a> Error for RewriteError<'a> {
             CommandPipeError(err) => Some(err),
             CommandExitCode(..) => None,
             CommandExitSignal(..) => None,
+            CreateTempfileError(err) => Some(err),
+            TempfileWriteError(err) => Some(err),
+            TempfileSeekError(err) => Some(err),
+            TempfileDisallowed => None,
         }
     }
 }
@@ -171,11 +159,62 @@ impl ProcessResult {
     }
 }
 
+trait ExitStatusSignal {
+    fn exit_signal(&self) -> Option<i32>;
+}
+
+#[cfg(unix)]
+impl<T: ExitStatusExt> ExitStatusSignal for T {
+    fn exit_signal(&self) -> Option<i32> {
+        self.signal()
+    }
+}
+
+#[cfg(windows)]
+impl<T: ExitStatusExt> ExitStatusSignal for T {
+    fn exit_signal(&self) -> Option<i32> {
+        None
+    }
+}
+
+// Drop wrapper that ensures a child is .kill'd when it goes out of scope
+#[derive(Debug)]
+struct KillChild(Child);
+
+impl Drop for KillChild {
+    fn drop(&mut self) {
+        if let Err(err) = self.kill() {
+            panic!("Failed to kill subprocess: {}", err);
+        }
+    }
+}
+
+impl From<Child> for KillChild {
+    fn from(child: Child) -> Self {
+        KillChild(child)
+    }
+}
+
+impl Deref for KillChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for KillChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
 fn process_file<Arg, Cmd>(
     path: &Path,
     cmd_parts: Cmd,
     with_env: bool,
     buffer_size: usize,
+    buffer_only: bool,
 ) -> Result<ProcessResult, RewriteError>
 where
     Arg: AsRef<OsStr>,
@@ -207,36 +246,62 @@ where
 
     // And go!
     // TODO: create a Drop wrapper that kills the process if something panics
-    let mut running_command = command
+    let mut child: KillChild = command
         .spawn()
-        .map_err(|err| RewriteError::SpawnError { command, err })?;
+        .map_err(|err| RewriteError::SpawnError { command, err })?
+        .into();
 
-    let child_stdout = running_command
-        .stdout
-        .as_mut()
-        .expect("Failed to get child stdout");
+    let process_result = {
+        let child_stdout = child.stdout.as_mut().expect("Failed to get child stdout");
 
-    // First, read into a buffer. Fall back to a file if we exceed buffer-size
-    let mut buffer = Vec::with_capacity(buffer_size);
+        // First, read into a buffer. Fall back to a file if we exceed buffer-size
+        let mut buffer = Vec::with_capacity(buffer_size);
 
-    let amount_read = {
-        let mut limited_reader = child_stdout.take(buffer_size as u64);
-        limited_reader
-            .read_to_end(&mut buffer)
-            .map_err(RewriteError::CommandPipeError)?
+        let amount_read = {
+            let mut limited_reader = child_stdout.take(buffer_size as u64);
+            limited_reader
+                .read_to_end(&mut buffer)
+                .map_err(RewriteError::CommandPipeError)?
+        };
+
+        if amount_read >= buffer_size {
+            if !buffer_only {
+                // If we exceeded the buffer limit, copy the remaining bytes to an unnamed temporary
+                // file.
+                let mut scratch_file = tempfile().map_err(RewriteError::CreateTempfileError)?;
+                io::copy(child_stdout, &mut scratch_file)
+                    .map_err(RewriteError::TempfileWriteError)?;
+                ProcessResult::new_buffer_file(buffer, scratch_file)
+                    .map_err(RewriteError::TempfileSeekError)?
+            } else {
+                return Err(RewriteError::TempfileDisallowed);
+            }
+        } else {
+            ProcessResult::new_buffer(buffer)
+        }
     };
 
-    if amount_read >= buffer_size {
-        panic!("Don't yet support large files");
-    } else {
-        Ok(ProcessResult::new_buffer(buffer))
+    let child_result = child
+        .wait()
+        .expect("Failed to wait for subprocess to finish");
+
+    match child_result.code() {
+        Some(0) => Ok(process_result),
+        Some(code) => Err(RewriteError::CommandExitCode(code)),
+        None => Err(RewriteError::CommandExitSignal(child_result.signal())),
     }
 }
 
 fn run(opt: &Opt) -> Result<(), RewriteError> {
     let path = &opt.rewrite_path;
 
-    let processed_data = process_file(path, opt.command.iter(), !opt.no_env, opt.buffer_size)?;
+    let processed_data = process_file(
+        path,
+        opt.command.iter(),
+        !opt.no_env,
+        opt.buffer_size,
+        opt.buffer_only,
+    )?;
 
     let mut dest_file = OpenOptions::new()
         .write(true)
@@ -253,7 +318,7 @@ fn main() {
     let opt = Opt::from_args();
 
     if let Err(err) = run(&opt) {
-        eprintln!("{}", err);
+        eprintln!("rewrite error: {}", err);
         exit(1);
     }
 }
