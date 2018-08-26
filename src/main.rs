@@ -288,7 +288,7 @@ where
     match child_result.code() {
         Some(0) => Ok(process_result),
         Some(code) => Err(RewriteError::CommandExitCode(code)),
-        None => Err(RewriteError::CommandExitSignal(child_result.signal())),
+        None => Err(RewriteError::CommandExitSignal(child_result.exit_signal())),
     }
 }
 
