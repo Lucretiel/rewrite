@@ -55,6 +55,16 @@ struct Opt {
     command: Vec<String>,
 }
 
+macro_rules! select_write {
+    ($match:expr => $dest:expr => {$(
+        $pat:pat => $fmt:expr $(, $arg:expr)*;
+    )*}) => ({
+        match $match {$(
+            $pat => write!($dest, $fmt, $($arg,)*),
+        )*}
+    })
+}
+
 #[derive(Debug)]
 enum RewriteError<'a> {
     ReadOpenError { path: &'a Path, err: io::Error },
@@ -74,39 +84,32 @@ impl<'a> Display for RewriteError<'a> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         use RewriteError::*;
 
-        match self {
-            ReadOpenError { path, err } => {
-                write!(f, "Failed to open '{}': {}", path.display(), err)
-            }
-            WriteOpenError { path, err } => write!(
-                f,
-                "Failed to open '{}' for writing: {}",
-                path.display(),
-                err
-            ),
-            WriteError { path, err } => write!(f, "Error writing tp '{}': {}", path.display(), err),
-            SpawnError { command, err } => write!(
-                f,
-                "Failed to spawn rewrite command ({:?}): {}",
-                command, err
-            ),
-            CommandPipeError(err) => write!(f, "Error reading subprocess output: {}", err),
-            CommandExitCode(code) => write!(f, "Command exited with non-zero status code {}", code),
-            CommandExitSignal(Some(sig)) => write!(f, "Subprocess exited via signal {}", sig),
-            CommandExitSignal(None) => write!(f, "Subprocess exited due to unknown signal"),
-            CreateTempfileError(err) => write!(
-                f,
-                "Failed to create temporary file for scratch space: {}",
-                err
-            ),
-            TempfileWriteError(err) => write!(
-                f,
-                "Error copying process output into temporary file: {}",
-                err
-            ),
-            TempfileSeekError(err) => write!(f, "Error seeking temporary file: {}", err),
-            TempfileDisallowed => write!(f, "command output exceeded in-memory buffer limit"),
-        }
+        select_write!(self => f => {
+            ReadOpenError { path, err } =>
+                "Failed to open '{}': {}", path.display(), err;
+            WriteOpenError { path, err } =>
+                "Failed to open '{}' for writing: {}",path.display(), err;
+            WriteError { path, err } =>
+                "Error writing tp '{}': {}", path.display(), err;
+            SpawnError { command, err } =>
+                "Failed to spawn rewrite command ({:?}): {}", command, err;
+            CommandPipeError(err) =>
+                "Error reading subprocess output: {}", err;
+            CommandExitCode(code) =>
+                "Command exited with non-zero status code {}", code;
+            CommandExitSignal(Some(sig)) =>
+                "Subprocess exited via signal {}", sig;
+            CommandExitSignal(None) =>
+                "Subprocess exited due to unknown signal";
+            CreateTempfileError(err) =>
+                "Failed to create temporary file for scratch space: {}", err;
+            TempfileWriteError(err) =>
+                "Error copying process output into temporary file: {}", err;
+            TempfileSeekError(err) =>
+                "Error seeking temporary file: {}", err;
+            TempfileDisallowed =>
+                "command output exceeded in-memory buffer limit";
+        })
     }
 }
 
