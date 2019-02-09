@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::env;
-use std::fs::File;
+use std::fs::{OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
@@ -15,9 +15,7 @@ use joinery::Joinable;
 use structopt::StructOpt;
 use tempfile::{Builder as TempFileBuilder, PersistError};
 
-/// rewrite edits a file in place in place with a command.
-///
-/// rewrite is a tool that edits a file in place with a command. The file is sent to the command
+/// rewrite edits a file in place in place with a command. The file is sent to the command
 /// via stdin, and is rewritten with the command's stdout. rewrite works by writing the command's
 /// stdout to a temporary file, then replacing the existing file with the temporary one. It's
 /// roughly equivelent to:
@@ -30,8 +28,6 @@ use tempfile::{Builder as TempFileBuilder, PersistError};
 /// If the command exits with a nonzero exit code, the target file is *not* overwritten.
 #[derive(Debug, StructOpt)]
 struct Opt {
-    // TODO: drop-priveleges. Should be relatively easy, but the process::Command interface
-    // makes it surprisingly difficult to compose.
     /// Run the command as normal (including writing the temporary file), but don't modify the file
     #[structopt(short = "n", long = "no-op")]
     no_op: bool,
@@ -62,6 +58,7 @@ struct Opt {
     shell_mode: bool,
 
     // TODO: it might be better to make this the default, and have a "keep-root" instead
+    // TODO: make this work on windows
     /// When running `sudo rewrite` to edit root files, run the command as the original user
     /// instead of root.
     #[structopt(short = "D", long = "drop-root")]
@@ -94,20 +91,6 @@ impl<T: ExitStatusExt> ExitStatusSignal for T {
     }
 }
 
-// Trait for calling exit on errors
-trait Bailer<T, E> {
-    fn or_bail(self, f: impl FnOnce(E)) -> T;
-}
-
-impl<T, E> Bailer<T, E> for Result<T, E> {
-    fn or_bail(self, f: impl FnOnce(E)) -> T {
-        self.unwrap_or_else(move |err| {
-            f(err);
-            exit(1)
-        })
-    }
-}
-
 #[derive(Debug)]
 enum RewriteError<'a> {
     Open(io::Error),
@@ -123,7 +106,17 @@ enum RewriteError<'a> {
 
 fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>> {
     let path = &opt.rewrite_path;
-    let file = File::open(path).map_err(RewriteError::Open)?;
+
+    // Note that we technically don't need the file to be writeable– rewrite works
+    // fine if the file is read only but the directory is writeable– but we don't
+    // want to edit read-only files as a courtesy to the user.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(path)
+        .map_err(RewriteError::Open)?;
+
     let file_permissions = file
         .metadata()
         .map_err(RewriteError::GetPermissions)?
@@ -144,7 +137,7 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
     // Attach the filename as a suffix so that we can tell what file this is scratch for
     let scratch_file = TempFileBuilder::new()
         .prefix(".rewrite-tmp-")
-        .suffix(filename.to_string_lossy().as_ref())
+        .suffix(format!("-{}", filename.to_string_lossy()).as_str())
         .tempfile_in(dir_path)
         .map_err(|err| RewriteError::CreateTemp { dir: dir_path, err })?;
 
@@ -159,6 +152,7 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
         .try_clone()
         .map_err(RewriteError::DupTemp)?;
 
+    // Build the command string. We use sudo to drop priveleges and sh for shell mode.
     let mut constructed_command = Vec::with_capacity(opt.command.len());
 
     if opt.drop_root {
