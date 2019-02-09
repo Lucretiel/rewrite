@@ -1,7 +1,3 @@
-extern crate joinery;
-extern crate structopt;
-extern crate tempfile;
-
 use std::borrow::Cow;
 use std::env;
 use std::fs::File;
@@ -226,7 +222,7 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
 }
 
 fn main() {
-    use RewriteError::*;
+    use crate::RewriteError::*;
 
     let opt = Opt::from_args();
     let path = &opt.rewrite_path;
