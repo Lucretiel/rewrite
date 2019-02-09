@@ -3,7 +3,6 @@ extern crate tempfile;
 
 use std::fs::File;
 use std::io;
-use std::borrow::Cow
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
