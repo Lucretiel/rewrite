@@ -1,9 +1,11 @@
+extern crate joinery;
 extern crate structopt;
 extern crate tempfile;
 
+use std::borrow::Cow;
+use std::env;
 use std::fs::File;
 use std::io;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 
@@ -13,9 +15,9 @@ use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt;
 
+use joinery::Joinable;
 use structopt::StructOpt;
 use tempfile::{Builder as TempFileBuilder, PersistError};
-use joinery;
 
 /// rewrite edits a file in place in place with a command.
 ///
@@ -34,7 +36,6 @@ use joinery;
 struct Opt {
     // TODO: drop-priveleges. Should be relatively easy, but the process::Command interface
     // makes it surprisingly difficult to compose.
-
     /// Run the command as normal (including writing the temporary file), but don't modify the file
     #[structopt(short = "n", long = "no-op")]
     no_op: bool,
@@ -44,7 +45,11 @@ struct Opt {
     no_env: bool,
 
     /// Create the temporary file in the same directory as the target file. This is the default.
-    #[structopt(short = "s", long = "sibling-temp", raw(overrides_with_all=r#"&["tmpdir-temp", "dir"]"#))]
+    #[structopt(
+        short = "s",
+        long = "sibling-temp",
+        raw(overrides_with_all = r#"&["tmpdir-temp", "dir"]"#)
+    )]
     sibling_dir: bool,
 
     /// Create the temporary file in the system temporary directory.
@@ -57,7 +62,7 @@ struct Opt {
 
     // TODO: make this work on windows
     /// Shell mode: concatenate the command with whitespace and run it in the shell (via sh -c)
-    #[structopt(short ="c", long = "shell-mode")]
+    #[structopt(short = "c", long = "shell-mode")]
     shell_mode: bool,
 
     // TODO: it might be better to make this the default, and have a "keep-root" instead
@@ -116,11 +121,17 @@ enum RewriteError<'a> {
     Signal(Option<i32>),
     Persist(PersistError),
     NoSudoUser(env::VarError),
+    GetPermissions(io::Error),
+    SetPermissions(io::Error),
 }
 
 fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>> {
     let path = &opt.rewrite_path;
     let file = File::open(path).map_err(RewriteError::Open)?;
+    let file_permissions = file
+        .metadata()
+        .map_err(RewriteError::GetPermissions)?
+        .permissions();
 
     // Get the desired directory
     let dir_path = if opt.tmpdir {
@@ -128,7 +139,8 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
     } else if let Some(ref target_dir) = opt.target_dir {
         target_dir
     } else {
-        path.parent().expect("Target file doesn't have a parent directory?")
+        path.parent()
+            .expect("Target file doesn't have a parent directory?")
     };
 
     let filename = path.file_name().expect("Target file doesn't have a name?");
@@ -156,17 +168,26 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
     if opt.drop_root {
         // Get the user id from the environment
         let username = env::var("SUDO_USER").map_err(RewriteError::NoSudoUser)?;
-        constructed_command.extend(["sudo".into(), "--user".into(), username]);
+        constructed_command.push(Cow::Borrowed("sudo"));
+        constructed_command.push(Cow::Borrowed("--user"));
+        constructed_command.push(Cow::Owned(username));
+        constructed_command.push(Cow::Borrowed("--"));
     }
 
     if opt.shell_mode {
         // Concat the command
-        let command =
+        let command = opt.command.iter().join_with(' ').to_string();
+        constructed_command.push("sh".into());
+        constructed_command.push("-c".into());
+        constructed_command.push(command.into());
+    } else {
+        constructed_command.extend(opt.command.iter().map(|part| Cow::Borrowed(part.as_str())));
     }
 
-    let mut cmd_iter = opt.command.iter();
+    let mut cmd_iter = constructed_command.iter().map(AsRef::as_ref);
 
-    // Create command. The expect shouldn't trigger, since structopt requires at least 1 arg.
+    // Construct the command. We're guaranteed to have a command because structopt
+    // requires the command vector to have at least one element.
     let mut command = Command::new(cmd_iter.next().expect("No command was given"));
 
     // Attach arguments
@@ -194,7 +215,11 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
     };
 
     if !opt.no_op {
-        scratch_file.persist(path).map_err(RewriteError::Persist)?;
+        scratch_file
+            .persist(path)
+            .map_err(RewriteError::Persist)?
+            .set_permissions(file_permissions)
+            .map_err(RewriteError::SetPermissions)?;
     }
 
     Ok(0)
@@ -228,6 +253,9 @@ fn main() {
                 Signal(None) => eprintln!("Command terminated from unknown signal"),
                 Signal(Some(sig)) => eprintln!("Command terminated from signal {}", sig),
                 Persist(err) => eprintln!("Error persisting temporary file: {}", err),
+                NoSudoUser(err) => eprintln!("--drop-priveleges was given, but there was an error reading SUDO_USER: {}", err),
+                GetPermissions(err) => eprintln!("Error getting file permissions for {}: {}", path.display(), err),
+                SetPermissions(err) => eprintln!("command completed successfully, but error restoring file permissions to the new file: {}", err),
             }
             1
         }
