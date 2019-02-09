@@ -1,14 +1,12 @@
 extern crate structopt;
 extern crate tempfile;
 
-use std::error::Error;
-use std::ffi::OsStr;
-use std::fmt::{self, Display, Formatter};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::ops::{Deref, DerefMut};
+use std::fs::File;
+use std::io;
+use std::borrow::Cow
+use std::env;
 use std::path::{Path, PathBuf};
-use std::process::{exit, Child, Command, Stdio};
+use std::process::{exit, Command, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -17,34 +15,57 @@ use std::os::unix::process::ExitStatusExt;
 use std::os::windows::process::ExitStatusExt;
 
 use structopt::StructOpt;
-use tempfile::tempfile;
+use tempfile::{Builder as TempFileBuilder, PersistError};
+use joinery;
 
+/// rewrite edits a file in place in place with a command.
+///
+/// rewrite is a tool that edits a file in place with a command. The file is sent to the command
+/// via stdin, and is rewritten with the command's stdout. rewrite works by writing the command's
+/// stdout to a temporary file, then replacing the existing file with the temporary one. It's
+/// roughly equivelent to:
+///
+///     my_command < file.txt > file.txt
+///
+/// By default, the temporary file is created in the same directory as the target file, though
+/// this can be changed.
+///
+/// If the command exits with a nonzero exit code, the target file is *not* overwritten.
 #[derive(Debug, StructOpt)]
 struct Opt {
-    #[structopt(short = "b", long = "buffer-size", default_value = "8388608")]
-    /// The size of the in-memory buffer to use
-    ///
-    /// If the command output exceeds the buffer, the command will create and use
-    /// a temporary file for the remaining output. Defaults to 8MB.
-    buffer_size: usize,
-
-    #[structopt(short = "o", long = "buffer-only")]
-    /// Don't use a temporary file. Fail if the file size exceeds the in-memory buffer.
-    buffer_only: bool,
-
     // TODO: drop-priveleges. Should be relatively easy, but the process::Command interface
     // makes it surprisingly difficult to compose.
+
+    /// Run the command as normal (including writing the temporary file), but don't modify the file
     #[structopt(short = "n", long = "no-op")]
-    /// Run the command as normal, but don't modify the file
-    ///
-    /// In no-op mode, rewrite will do everything it normally does, including
-    /// writing to a temporary file, if enabled. The only thing it doesn't do is
-    /// modify the contents of the file.
     no_op: bool,
 
-    #[structopt(short = "E", long = "no-env")]
     /// Don't set REWRITE_* environment variables in the target
+    #[structopt(short = "e", long = "no-env")]
     no_env: bool,
+
+    /// Create the temporary file in the same directory as the target file. This is the default.
+    #[structopt(short = "s", long = "sibling-temp", raw(overrides_with_all=r#"&["tmpdir-temp", "dir"]"#))]
+    sibling_dir: bool,
+
+    /// Create the temporary file in the system temporary directory.
+    #[structopt(short = "t", long = "tmpdir-temp")]
+    tmpdir: bool,
+
+    /// Create the temporary file in the given directory
+    #[structopt(short = "d", long = "dir")]
+    target_dir: Option<PathBuf>,
+
+    // TODO: make this work on windows
+    /// Shell mode: concatenate the command with whitespace and run it in the shell (via sh -c)
+    #[structopt(short ="c", long = "shell-mode")]
+    shell_mode: bool,
+
+    // TODO: it might be better to make this the default, and have a "keep-root" instead
+    /// When running `sudo rewrite` to edit root files, run the command as the original user
+    /// instead of root.
+    #[structopt(short = "D", long = "drop-root")]
+    drop_root: bool,
 
     #[structopt(parse(from_os_str))]
     /// The file to rewrite
@@ -53,113 +74,6 @@ struct Opt {
     #[structopt(raw(last = "true"), raw(required = "true"))]
     /// The subcommand to run
     command: Vec<String>,
-}
-
-macro_rules! select_write {
-    ($match:expr => $dest:expr => {$(
-        $pat:pat => $fmt:expr $(, $arg:expr)*;
-    )*}) => ({
-        match $match {$(
-            $pat => write!($dest, $fmt, $($arg,)*),
-        )*}
-    })
-}
-
-#[derive(Debug)]
-enum RewriteError<'a> {
-    ReadOpenError { path: &'a Path, err: io::Error },
-    WriteOpenError { path: &'a Path, err: io::Error },
-    WriteError { path: &'a Path, err: io::Error },
-    SpawnError { command: Command, err: io::Error },
-    CommandPipeError(io::Error),
-    CommandExitCode(i32),
-    CommandExitSignal(Option<i32>),
-    CreateTempfileError(io::Error),
-    TempfileWriteError(io::Error),
-    TempfileSeekError(io::Error),
-    TempfileDisallowed,
-}
-
-impl<'a> Display for RewriteError<'a> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        use RewriteError::*;
-
-        select_write!(self => f => {
-            ReadOpenError { path, err } =>
-                "Failed to open '{}': {}", path.display(), err;
-            WriteOpenError { path, err } =>
-                "Failed to open '{}' for writing: {}",path.display(), err;
-            WriteError { path, err } =>
-                "Error writing tp '{}': {}", path.display(), err;
-            SpawnError { command, err } =>
-                "Failed to spawn rewrite command ({:?}): {}", command, err;
-            CommandPipeError(err) =>
-                "Error reading subprocess output: {}", err;
-            CommandExitCode(code) =>
-                "Command exited with non-zero status code {}", code;
-            CommandExitSignal(Some(sig)) =>
-                "Subprocess exited via signal {}", sig;
-            CommandExitSignal(None) =>
-                "Subprocess exited due to unknown signal";
-            CreateTempfileError(err) =>
-                "Failed to create temporary file for scratch space: {}", err;
-            TempfileWriteError(err) =>
-                "Error copying process output into temporary file: {}", err;
-            TempfileSeekError(err) =>
-                "Error seeking temporary file: {}", err;
-            TempfileDisallowed =>
-                "command output exceeded in-memory buffer limit";
-        })
-    }
-}
-
-impl<'a> Error for RewriteError<'a> {
-    fn cause(&self) -> Option<&dyn Error> {
-        use RewriteError::*;
-
-        match self {
-            ReadOpenError { err, .. } => Some(err),
-            WriteOpenError { err, .. } => Some(err),
-            WriteError { err, .. } => Some(err),
-            SpawnError { err, .. } => Some(err),
-            CommandPipeError(err) => Some(err),
-            CommandExitCode(..) => None,
-            CommandExitSignal(..) => None,
-            CreateTempfileError(err) => Some(err),
-            TempfileWriteError(err) => Some(err),
-            TempfileSeekError(err) => Some(err),
-            TempfileDisallowed => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ProcessResult {
-    buffer: Vec<u8>,
-    file: Option<File>,
-}
-
-impl ProcessResult {
-    fn new_buffer(buffer: Vec<u8>) -> Self {
-        ProcessResult { buffer, file: None }
-    }
-
-    fn new_buffer_file(buffer: Vec<u8>, mut file: File) -> io::Result<Self> {
-        file.seek(SeekFrom::Start(0))?;
-        Ok(ProcessResult {
-            buffer,
-            file: Some(file),
-        })
-    }
-
-    fn write_to_file(self, dest: &mut File) -> io::Result<()> {
-        dest.write_all(&self.buffer)?;
-
-        match self.file {
-            Some(mut file) => io::copy(&mut file, dest).map(|_| ()),
-            None => Ok(()),
-        }
-    }
 }
 
 trait ExitStatusSignal {
@@ -180,52 +94,78 @@ impl<T: ExitStatusExt> ExitStatusSignal for T {
     }
 }
 
-// Drop wrapper that ensures a child is .kill'd when it goes out of scope
+// Trait for calling exit on errors
+trait Bailer<T, E> {
+    fn or_bail(self, f: impl FnOnce(E)) -> T;
+}
+
+impl<T, E> Bailer<T, E> for Result<T, E> {
+    fn or_bail(self, f: impl FnOnce(E)) -> T {
+        self.unwrap_or_else(move |err| {
+            f(err);
+            exit(1)
+        })
+    }
+}
+
 #[derive(Debug)]
-struct KillChild(Child);
-
-impl Drop for KillChild {
-    fn drop(&mut self) {
-        if let Err(err) = self.kill() {
-            panic!("Failed to kill subprocess: {}", err);
-        }
-    }
+enum RewriteError<'a> {
+    Open(io::Error),
+    CreateTemp { dir: &'a Path, err: io::Error },
+    DupTemp(io::Error),
+    SpawnChild(io::Error),
+    Signal(Option<i32>),
+    Persist(PersistError),
+    NoSudoUser(env::VarError),
 }
 
-impl From<Child> for KillChild {
-    fn from(child: Child) -> Self {
-        KillChild(child)
+fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>> {
+    let path = &opt.rewrite_path;
+    let file = File::open(path).map_err(RewriteError::Open)?;
+
+    // Get the desired directory
+    let dir_path = if opt.tmpdir {
+        sys_temp_dir
+    } else if let Some(ref target_dir) = opt.target_dir {
+        target_dir
+    } else {
+        path.parent().expect("Target file doesn't have a parent directory?")
+    };
+
+    let filename = path.file_name().expect("Target file doesn't have a name?");
+
+    // Attach the filename as a suffix so that we can tell what file this is scratch for
+    let scratch_file = TempFileBuilder::new()
+        .prefix(".rewrite-tmp-")
+        .suffix(filename.to_string_lossy().as_ref())
+        .tempfile_in(dir_path)
+        .map_err(|err| RewriteError::CreateTemp { dir: dir_path, err })?;
+
+    // We can't pass a NamedTempFile to a subprocess, so we attempt to duplicate
+    // the file descriptor and create a `File`.
+    // TODO: in principle, this shouldn't be necessary. A NamedTemporaryFile is
+    // a pair of File and TempPath, the latter of which deletes the file on drop.
+    // There is an open issue on github to allow the file to be destructured:
+    // https://github.com/Stebalien/tempfile/issues/60
+    let scratch_file_for_child = scratch_file
+        .as_file()
+        .try_clone()
+        .map_err(RewriteError::DupTemp)?;
+
+    let mut constructed_command = Vec::with_capacity(opt.command.len());
+
+    if opt.drop_root {
+        // Get the user id from the environment
+        let username = env::var("SUDO_USER").map_err(RewriteError::NoSudoUser)?;
+        constructed_command.extend(["sudo".into(), "--user".into(), username]);
     }
-}
 
-impl Deref for KillChild {
-    type Target = Child;
-
-    fn deref(&self) -> &Child {
-        &self.0
+    if opt.shell_mode {
+        // Concat the command
+        let command =
     }
-}
 
-impl DerefMut for KillChild {
-    fn deref_mut(&mut self) -> &mut Child {
-        &mut self.0
-    }
-}
-
-fn process_file<Arg, Cmd>(
-    path: &Path,
-    cmd_parts: Cmd,
-    with_env: bool,
-    buffer_size: usize,
-    buffer_only: bool,
-) -> Result<ProcessResult, RewriteError>
-where
-    Arg: AsRef<OsStr>,
-    Cmd: IntoIterator<Item = Arg>,
-{
-    let file = File::open(path).map_err(|err| RewriteError::ReadOpenError { err, path })?;
-
-    let mut cmd_iter = cmd_parts.into_iter();
+    let mut cmd_iter = opt.command.iter();
 
     // Create command. The expect shouldn't trigger, since structopt requires at least 1 arg.
     let mut command = Command::new(cmd_iter.next().expect("No command was given"));
@@ -234,99 +174,65 @@ where
     command.args(cmd_iter);
 
     // Attach environment
-    if with_env {
-        command
-            .env("REWRITE_PATH", path)
-            // Panic shouldn't trigger, because File::open would have already failed.
-            .env("REWRITE_FILENAME", path.file_name().expect("Invalid filename"));
+    if !opt.no_env {
+        command.env("REWRITE_FILE", path);
     }
 
-    // Attach pipes to the command
+    // Attach input file, output file
     command
         .stdin(file)
-        .stdout(Stdio::piped())
+        .stdout(scratch_file_for_child)
         .stderr(Stdio::inherit());
 
     // And go!
-    // TODO: create a Drop wrapper that kills the process if something panics
-    let mut child: KillChild = command
-        .spawn()
-        .map_err(|err| RewriteError::SpawnError { command, err })?
-        .into();
+    let child_result = command.status().map_err(RewriteError::SpawnChild)?;
 
-    let process_result = {
-        let child_stdout = child.stdout.as_mut().expect("Failed to get child stdout");
-
-        // First, read into a buffer. Fall back to a file if we exceed buffer-size
-        let mut buffer = Vec::with_capacity(buffer_size);
-
-        let amount_read = {
-            let mut limited_reader = child_stdout.take(buffer_size as u64);
-            limited_reader
-                .read_to_end(&mut buffer)
-                .map_err(RewriteError::CommandPipeError)?
-        };
-
-        if amount_read >= buffer_size {
-            if !buffer_only {
-                // If we exceeded the buffer limit, copy the remaining bytes to an unnamed temporary
-                // file.
-                let mut scratch_file = tempfile().map_err(RewriteError::CreateTempfileError)?;
-                io::copy(child_stdout, &mut scratch_file)
-                    .map_err(RewriteError::TempfileWriteError)?;
-                ProcessResult::new_buffer_file(buffer, scratch_file)
-                    .map_err(RewriteError::TempfileSeekError)?
-            } else {
-                return Err(RewriteError::TempfileDisallowed);
-            }
-        } else {
-            ProcessResult::new_buffer(buffer)
-        }
+    // Check for success
+    match child_result.code() {
+        Some(0) => {}
+        Some(code) => return Ok(code),
+        None => return Err(RewriteError::Signal(child_result.exit_signal())),
     };
 
-    let child_result = child
-        .wait()
-        .expect("Failed to wait for subprocess to finish");
-
-    match child_result.code() {
-        Some(0) => Ok(process_result),
-        Some(code) => Err(RewriteError::CommandExitCode(code)),
-        None => Err(RewriteError::CommandExitSignal(child_result.exit_signal())),
-    }
-}
-
-fn run(opt: &Opt) -> Result<(), RewriteError> {
-    let path = &opt.rewrite_path;
-
-    let processed_data = process_file(
-        path,
-        opt.command.iter(),
-        !opt.no_env,
-        opt.buffer_size,
-        opt.buffer_only,
-    )?;
-
     if !opt.no_op {
-        let mut dest_file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&opt.rewrite_path)
-            .map_err(|err| RewriteError::WriteOpenError { err, path })?;
-
-        processed_data
-            .write_to_file(&mut dest_file)
-            .map_err(|err| RewriteError::WriteError { err, path })
-    } else {
-        eprintln!("rewrite: successfully processed file. --no-op, skipping writeback.");
-        Ok(())
+        scratch_file.persist(path).map_err(RewriteError::Persist)?;
     }
+
+    Ok(0)
 }
 
 fn main() {
-    let opt = Opt::from_args();
+    use RewriteError::*;
 
-    if let Err(err) = run(&opt) {
-        eprintln!("rewrite error: {}", err);
-        exit(1);
-    }
+    let opt = Opt::from_args();
+    let path = &opt.rewrite_path;
+    let sys_temp_dir = env::temp_dir();
+
+    let result = run(&sys_temp_dir, &opt);
+
+    let code = match result {
+        Ok(0) => 0,
+        Ok(code) => {
+            eprintln!("Command exited with status code {}; skipping write", code);
+            code
+        }
+        Err(err) => {
+            match err {
+                Open(err) => eprintln!("Error opening '{}' for read: {}", path.display(), err),
+                CreateTemp { dir, err } => eprintln!(
+                    "Error creating temporary file in '{}': {}",
+                    dir.display(),
+                    err
+                ),
+                DupTemp(err) => eprintln!("Error creating duplicate file descriptor: {}", err),
+                SpawnChild(err) => eprintln!("Error spawning command: {}", err),
+                Signal(None) => eprintln!("Command terminated from unknown signal"),
+                Signal(Some(sig)) => eprintln!("Command terminated from signal {}", sig),
+                Persist(err) => eprintln!("Error persisting temporary file: {}", err),
+            }
+            1
+        }
+    };
+
+    exit(code);
 }
