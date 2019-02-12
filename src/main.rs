@@ -20,7 +20,8 @@ use tempfile::{Builder as TempFileBuilder, PersistError};
 /// stdout to a temporary file, then replacing the existing file with the temporary one. It's
 /// roughly equivelent to:
 ///
-///     my_command < file.txt > file.txt
+///     TMP="$(mktemp --tmpdir "$(dirname "$TARGET")")"
+///     my_command < "$TARGET" > "$TMP" && mv "$TMP" "$TARGET"
 ///
 /// By default, the temporary file is created in the same directory as the target file, though
 /// this can be changed.
