@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 use std::env;
-use std::fs::{OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
+use std::ffi::OsStr;
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -11,66 +12,80 @@ use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt;
 
-use joinery::Joinable;
+use joinery::JoinableIterator;
 use structopt::StructOpt;
 use tempfile::{Builder as TempFileBuilder, PersistError};
 
 /// rewrite edits a file in place in place with a command. The file is sent to the command
 /// via stdin, and is rewritten with the command's stdout. rewrite works by writing the command's
-/// stdout to a temporary file, then replacing the existing file with the temporary one. It's
-/// roughly equivelent to:
+/// stdout to a temporary file, then replacing the existing file with the temporary one. These
+/// two commands are roughly equivelent:
 ///
-///     TMP="$(mktemp)"
-///     my_command < "$TARGET" > "$TMP" && mv "$TMP" "$TARGET" || rm -f "$TMP"
+///     > TMP="$(mktemp)"
+///     > my_command < "$TARGET" > "$TMP" && mv "$TMP" "$TARGET" || rm -f "$TMP"
 ///
 /// By default, the temporary file is created in the same directory as the target file, though
 /// this can be changed.
 ///
 /// If the command exits with a nonzero exit code, the target file is *not* overwritten.
-#[derive(Debug, StructOpt)]
+#[derive(Debug, Clone, StructOpt)]
+#[structopt(rename_all = "kebab-case")]
 struct Opt {
     /// Run the command as normal (including writing the temporary file), but don't modify the file
-    #[structopt(short = "n", long = "no-op")]
+    #[structopt(short, long)]
     no_op: bool,
 
     /// Don't set REWRITE_* environment variables in the target
-    #[structopt(short = "e", long = "no-env")]
+    #[structopt(short = "e", long)]
     no_env: bool,
 
     /// Create the temporary file in the same directory as the target file. This is the default.
-    #[structopt(
-        short = "s",
-        long = "sibling-temp",
-        raw(overrides_with_all = r#"&["tmpdir-temp", "dir"]"#)
-    )]
+    #[structopt(short, long, raw(overrides_with_all = r#"&["tmpdir-temp", "dir"]"#))]
     sibling_dir: bool,
 
     /// Create the temporary file in the system temporary directory.
-    #[structopt(short = "t", long = "tmpdir-temp")]
-    tmpdir: bool,
+    #[structopt(short, long)]
+    temp_dir: bool,
 
     /// Create the temporary file in the given directory
-    #[structopt(short = "d", long = "dir")]
-    target_dir: Option<PathBuf>,
+    #[structopt(short, long)]
+    dir: Option<PathBuf>,
 
     // TODO: make this work on windows
     /// Shell mode: concatenate the command with whitespace and run it in the shell (via sh -c)
-    #[structopt(short = "c", long = "shell-mode")]
+    #[structopt(short = "c", long)]
     shell_mode: bool,
 
     // TODO: it might be better to make this the default, and have a "keep-root" instead
     // TODO: make this work on windows
     /// When running `sudo rewrite` to edit root files, run the command as the original user
     /// instead of root.
-    #[structopt(short = "D", long = "drop-root")]
+    #[structopt(short = "D", long)]
     drop_root: bool,
 
-    #[structopt(parse(from_os_str))]
+    /// Read from stdin instead of the file.
+    ///
+    /// Instead of piping the file into the command, forward stdin to it. Use
+    /// this if you want to use `rewrite` at the end of a pipeline. If you use
+    /// this option, you can omit a command, and rewrite will rewrite the file
+    /// with stdin directly.
+    ///
+    /// Note that running rewrite in stdin mode (currently) still requires the
+    /// target file to already exist, though this may change in the future.
+    #[structopt(short = "i", long)]
+    stdin: bool,
+
+    // TODO: verbose mode
+
     /// The file to rewrite
+    #[structopt(parse(from_os_str))]
     rewrite_path: PathBuf,
 
-    #[structopt(raw(last = "true"), raw(required = "true"))]
-    /// The subcommand to run
+    /// The subcommand to run.
+    ///
+    /// Make sure to use -- to separate the flags to this command from flags to
+    /// rewrite. Required unless you're also using --stdin
+    #[structopt(raw(last="true"), required_unless = "stdin")]
     command: Vec<String>,
 }
 
@@ -111,6 +126,16 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
     // Note that we technically don't need the file to be writeable– rewrite works
     // fine if the file is read only but the directory is writeable– but we don't
     // want to edit read-only files as a courtesy to the user.
+
+    // FIXME: we open the file in write mode as a shortcut to test if we have write
+    // permission, because Rust currently doesn't have a portable way of determining
+    // this from a stat. Even on UNIX platforms, we have to manually examine the mode
+    // bits to figure it out.
+    // FIXME: in stdin mode, it's not strictly necessary to open the file, since
+    // we never read OR write to it (we read from stdin, and rename(3) the temp file).
+    // However, it's convenient to be assured that the file already exists, and
+    // has the correct permissions. Still, it might be better to not open it
+    // unless necessary.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -124,15 +149,16 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
         .permissions();
 
     // Get the desired directory
-    let dir_path = if opt.tmpdir {
+    let dir_path = if opt.temp_dir {
         sys_temp_dir
-    } else if let Some(ref target_dir) = opt.target_dir {
-        target_dir
+    } else if let Some(ref dir) = opt.dir {
+        dir
     } else {
         path.parent()
             .expect("Target file doesn't have a parent directory?")
     };
 
+    // This panic shouldn't happen because the file would have failed to open
     let filename = path.file_name().expect("Target file doesn't have a name?");
 
     // Attach the filename as a suffix so that we can tell what file this is scratch for
@@ -154,6 +180,7 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
         .map_err(RewriteError::DupTemp)?;
 
     // Build the command string. We use sudo to drop priveleges and sh for shell mode.
+    // TODO: instead of sudo and sh, find portable equivelents
     let mut constructed_command = Vec::with_capacity(opt.command.len());
 
     if opt.drop_root {
@@ -186,14 +213,20 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
 
     // Attach environment
     if !opt.no_env {
-        command.env("REWRITE_FILE", path);
+        command.env("REWRITE_TEMPFILE", scratch_file.path());
+        command.env("REWRITE_OUTPUT", path);
+        command.env("REWRITE_INPUT", if opt.stdin { OsStr::new("-") } else { path.as_os_str() });
     }
 
-    // Attach input file, output file
-    command
-        .stdin(file)
-        .stdout(scratch_file_for_child)
-        .stderr(Stdio::inherit());
+    // Attach input file
+    if opt.stdin {
+        command.stdin(Stdio::inherit());
+    } else {
+        command.stdin(file);
+    }
+
+    // Attach output file and stderr
+    command.stdout(scratch_file_for_child).stderr(Stdio::inherit());
 
     // And go!
     let child_result = command.status().map_err(RewriteError::SpawnChild)?;
@@ -205,6 +238,8 @@ fn run<'a>(sys_temp_dir: &'a Path, opt: &'a Opt) -> Result<i32, RewriteError<'a>
         None => return Err(RewriteError::Signal(child_result.exit_signal())),
     };
 
+    // If all went well, and we're not in no-op mode, replace the original file
+    // with the temporary file.
     if !opt.no_op {
         scratch_file
             .persist(path)
